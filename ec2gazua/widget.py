@@ -11,20 +11,17 @@ from urwid import Text
 
 
 class ClippedText(Text):
-
     def __init__(self, *args, **kwargs):
         super(ClippedText, self).__init__(*args, wrap='clip', **kwargs)
 
 
 class SearchEdit(AttrMap):
-
     def __init__(self):
         edit = Edit('Search: ')
         super(SearchEdit, self).__init__(edit, 'header')
 
 
 class SelectableText(Text):
-
     def __init__(self, markup, *args, **kwargs):
         super(SelectableText, self).__init__(markup, wrap='clip')
 
@@ -38,8 +35,7 @@ class SelectableText(Text):
 class SSHCheckBox(CheckBox):
     not_checkable_callback = None
 
-    def __init__(self, label, checkable, enter_callback,
-                 not_checkable_callback, *args, **kwargs):
+    def __init__(self, label, checkable, enter_callback, not_checkable_callback, *args, **kwargs):
         self.checkable = checkable
         self.enter_callback = enter_callback
         self.not_checkable_callback = not_checkable_callback
@@ -67,17 +63,14 @@ class GazuaFrame(Frame):
     def __init__(self, *args, **kwargs):
         self.search_edit = Edit('Search: ')
         self.arrow_callback = kwargs['arrow_callback']
-        super(GazuaFrame, self).__init__(*args,
-                                         header=AttrMap(self.search_edit,
-                                                        'header'))
+        super(GazuaFrame, self).__init__(*args, header=AttrMap(self.search_edit, 'header'))
 
     def keypress(self, size, key):
         if len(key) == 1 and key.isalpha:
             if re.compile('^[a-zA-Z0-9]$').match(key):
                 self.search_edit.insert_text(key)
         elif key == 'backspace':
-            self.search_edit.set_edit_text(
-                self.search_edit.get_edit_text()[0:-1])
+            self.search_edit.set_edit_text(self.search_edit.get_edit_text()[0:-1])
         elif key == 'left':
             if self.column_pos == 0:
                 self.arrow_callback(None)
@@ -96,11 +89,9 @@ class GazuaFrame(Frame):
                 self.arrow_callback(2)
             else:
                 self.arrow_callback(None)
-
         return super(GazuaFrame, self).keypress(size, key)
 
 
 class ExpadableListWalker(SimpleFocusListWalker):
-
     def set_focus(self, position):
         super(ExpadableListWalker, self).set_focus(position)

@@ -1,28 +1,30 @@
 # -*- coding: utf-8 -*-
-
-import boto3
-
+import logging
 from collections import OrderedDict
-
 from os.path import expanduser
 from os.path import isfile
 
+import boto3
+
 from ec2gazua.config import Config
-from ec2gazua.logger import console
 from ec2gazua.logger import log
+
+logger = logging.getLogger('GAZUA')
 
 
 class EC2InstanceManager(object):
     instances = {}
 
-    def add_instance(self, aws_name, group, instance):
+    def add_instance(self, aws_name, instance):
         if aws_name not in self.instances:
             self.instances[aws_name] = {}
-
-        if group not in self.instances[aws_name]:
-            self.instances[aws_name][group] = []
-
-        self.instances[aws_name][group].append(instance)
+        for cluster in instance.clusters:
+            if cluster not in self.instances[aws_name]:
+                self.instances[aws_name][cluster] = {}
+            for task_definition in instance.task_definitions:
+                if task_definition not in self.instances[aws_name][cluster]:
+                    self.instances[aws_name][cluster][task_definition] = []
+                self.instances[aws_name][cluster][task_definition].append(instance)
 
     @property
     def aws_names(self):
@@ -30,72 +32,129 @@ class EC2InstanceManager(object):
 
     def sort(self):
         sorted_instances = OrderedDict()
-
-        for aws_name, groups in OrderedDict(
-                sorted(self.instances.items(),
-                       key=lambda x: x[0])).items():
-
+        for aws_name, clusters in OrderedDict(sorted(self.instances.items(), key=lambda x: x[0])).items():
             sorted_instances[aws_name] = {}
-
-            for group, instances in OrderedDict(
-                    sorted(groups.items(), key=lambda x: x[0])).items():
-                instances.sort(key=lambda x: x.name)
-                sorted_instances[aws_name][group] = instances
-
+            for cluster, task_definitions in OrderedDict(sorted(clusters.items(), key=lambda x: x[0])).items():
+                sorted_instances[aws_name][cluster] = {}
+                for task_definition, instances in OrderedDict(
+                        sorted(task_definitions.items(), key=lambda x: x[0])).items():
+                    instances.sort(key=lambda x: x.name)
+                    sorted_instances[aws_name][cluster][task_definition] = instances
         self.instances = sorted_instances
 
 
 class EC2InstanceLoader(object):
-    config = Config()
+    def __init__(self, config_path):
+        self.config = Config(config_path)
 
-    def _request_instances(self, aws_name):
-        credential = self.config[aws_name]['credential']
-        session = boto3.Session(
-            aws_access_key_id=credential['aws_access_key_id'],
-            aws_secret_access_key=credential['aws_secret_access_key'],
-            region_name=credential['region'])
+    @staticmethod
+    def _request_cluster_arns(client):
+        return client.list_clusters()['clusterArns']
 
-        client = session.client('ec2')
+    @staticmethod
+    def _request_cluster_names(client, cluster_arns):
+        return {
+            x['clusterArn']: x['clusterName']
+            for x in client.describe_clusters(clusters=cluster_arns)['clusters']
+        }
 
-        instances = []
-        for revs in client.describe_instances()['Reservations']:
-            instances += revs['Instances']
-        return instances
+    def _request_container_instance_ids(self, client, clusters):
+        container_instance_id_map = {}
+        for cluster in clusters:
+            container_instances = client.list_container_instances(cluster=cluster)['containerInstanceArns']
+            if container_instances:
+                container_instance_describes = client.describe_container_instances(
+                    cluster=cluster, containerInstances=container_instances)['containerInstances']
+                for c in container_instance_describes:
+                    container_instance_id_map[c['containerInstanceArn']] = c['ec2InstanceId']
+        return container_instance_id_map
+
+    @staticmethod
+    def _request_task_definitions(client):
+        task_definition_family_map = {}
+        for x in client.list_task_definition_families(status='ACTIVE')['families']:
+            task_definition = client.describe_task_definition(taskDefinition=x)['taskDefinition']
+            logger.debug(f'read task definition: {task_definition["family"]}')
+            task_definition_family_map[task_definition['taskDefinitionArn']] = task_definition['family']
+        return task_definition_family_map
+
+    @staticmethod
+    def _request_tasks(client, clusters):
+        tasks = []
+        for c in clusters:
+            task_arns = client.list_tasks(cluster=c)['taskArns']
+            task_describes = client.describe_tasks(cluster=c, tasks=task_arns)['tasks'] if task_arns else []
+            tasks += [t for t in task_describes if 'containerInstanceArn' in t]
+        return tasks
+
+    @staticmethod
+    def _request_instances(client, instance_ids):
+        return [y for x in client.describe_instances(InstanceIds=instance_ids)['Reservations'] for y in x['Instances']]
 
     def load_all(self):
         manager = EC2InstanceManager()
-
+        logger.info('ECS EC2 Gazua~!!')
         for aws_name, item in self.config.items():
-            console('Instance loading [%s]' % aws_name)
-            aws_instances = self._request_instances(aws_name)
+            logger.info(f'Instance loading: {aws_name}')
+            credential = self.config[aws_name]['credential']
+            session = boto3.Session(
+                aws_access_key_id=credential['aws_access_key_id'],
+                aws_secret_access_key=credential['aws_secret_access_key'],
+                region_name=credential['region'])
+            ec2_client = session.client('ec2')
+            ecs_client = session.client('ecs')
+            logger.debug('boto3 session, client created')
+            cluster_arns = self._request_cluster_arns(ecs_client)
+            logger.debug('read cluster list')
+            cluster_names = self._request_cluster_names(ecs_client, cluster_arns)
+            logger.debug('read cluster names')
+            ci_ids = self._request_container_instance_ids(ecs_client, cluster_arns)
+            logger.debug('read container instance ids')
+            tds = self._request_task_definitions(ecs_client)
+            logger.debug('read task definitions')
 
-            for aws_instance in aws_instances:
-                ec2_instance = EC2Instance(self.config[aws_name], aws_instance)
+            def get_td(arn):
+                return tds[arn] if arn in tds else 'UNKNOWN'
 
-                if self.config[aws_name]['filter'][
-                    'connectable'] and not ec2_instance.is_connectable:
+            tasks = self._request_tasks(ecs_client, cluster_arns)
+            logger.debug('read tasks')
+            instance_ids = list(set([ci_ids[t['containerInstanceArn']] for t in tasks]))
+            instances = self._request_instances(ec2_client, instance_ids)
+            logger.debug('read instances')
+            id_cluster_map = {}
+            id_td_map = {}
+            for t in tasks:
+                if ci_ids[t['containerInstanceArn']] not in id_cluster_map:
+                    id_cluster_map[ci_ids[t['containerInstanceArn']]] = set()
+                id_cluster_map[ci_ids[t['containerInstanceArn']]].add(cluster_names[t['clusterArn']])
+                if ci_ids[t['containerInstanceArn']] not in id_td_map:
+                    id_td_map[ci_ids[t['containerInstanceArn']]] = set()
+                id_td_map[ci_ids[t['containerInstanceArn']]].add(get_td(t['taskDefinitionArn']))
+            logger.debug('instance, cluster, task definition map created')
+            for instance in instances:
+                cluster_arns = id_cluster_map[instance['InstanceId']]
+                task_definitions = id_td_map[instance['InstanceId']]
+                ec2_instance = EC2Instance(self.config[aws_name], instance, cluster_arns, task_definitions)
+                if self.config[aws_name]['filter']['connectable'] and not ec2_instance.is_connectable:
                     continue
-
-                manager.add_instance(aws_name, ec2_instance.group,
-                                     ec2_instance)
-
+                manager.add_instance(aws_name, ec2_instance)
+            logger.info(f'Instance loaded: {aws_name}')
         manager.sort()
-
         return manager
 
 
 class EC2Instance(object):
     DEFAULT_NAME = "UNKNOWN-NAME"
-    DEFAULT_GROUP = "UNKNOWN-GROUP"
 
-    def __init__(self, config, instance):
+    def __init__(self, config, instance, clusters, task_definitions):
         self.config = config
         self.instance = instance
+        self.clusters = clusters
+        self.task_definitions = task_definitions
 
     @property
     def tags(self):
-        return {t['Key']: t['Value'] for t in self.instance.get('Tags', {}) if
-                t['Value'] != ''}
+        return {t['Key']: t['Value'] for t in self.instance.get('Tags', {}) if t['Value'] != ''}
 
     @property
     def id(self):
@@ -108,12 +167,6 @@ class EC2Instance(object):
         return self.id
 
     @property
-    def group(self):
-        if self.config['group-tag'] in self.tags:
-            return self.tags[self.config['group-tag']]
-        return self.DEFAULT_GROUP
-
-    @property
     def type(self):
         return self.instance['InstanceType']
 
@@ -122,8 +175,8 @@ class EC2Instance(object):
         option = self.config['key-file']['default']
         key_name = self.instance.get('KeyName') if option == 'auto' else option
         override = self.config['key-file']
-        for group, value in override.get('group', {}).items():
-            if group in self.group:
+        for cluster, value in override.get('cluster', {}).items():
+            if cluster in self.clusters:
                 key_name = value
         for name, value in override.get('name', {}).items():
             if name in self.name:
@@ -159,8 +212,8 @@ class EC2Instance(object):
     def connect_ip(self):
         ip_type = self.config['connect-ip']['default']
         override = self.config['connect-ip']
-        for group, value in override.get('group', {}).items():
-            if group in self.group:
+        for cluster, value in override.get('cluster', {}).items():
+            if cluster in self.clusters:
                 ip_type = value
         for name, value in override.get('name', {}).items():
             if name in self.name:
@@ -171,8 +224,8 @@ class EC2Instance(object):
     def user(self):
         user = self.config['user']['default']
         override = self.config['user']
-        for group, value in override.get('group', {}).items():
-            if group in self.group:
+        for cluster, value in override.get('cluster', {}).items():
+            if cluster in self.clusters:
                 user = value
         for name, value in override.get('name', {}).items():
             if name in self.name:
@@ -190,5 +243,4 @@ class EC2Instance(object):
 
     @property
     def is_connectable(self):
-        return self.is_running and self.has_key_file and \
-               self.connect_ip is not None
+        return self.is_running and self.has_key_file and self.connect_ip is not None
